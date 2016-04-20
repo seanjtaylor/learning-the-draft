@@ -1,0 +1,205 @@
+---
+title: "Learning the NFL Draft"
+author: "Sean J. Taylor"
+output:
+  html_document:
+    theme: journal
+    css: style.css
+---
+
+<a href="https://twitter.com/share" class="twitter-share-button" data-via="seanjtaylor">Tweet</a>
+<script>!function(d,s,id){var js,fjs=d.getElementsByTagName(s)[0],p=/^http:/.test(d.location)?'http':'https';if(!d.getElementById(id)){js=d.createElement(s);js.id=id;js.src=p+'://platform.twitter.com/widgets.js';fjs.parentNode.insertBefore(js,fjs);}}(document, 'script', 'twitter-wjs');</script>
+
+I love watching the NFL, but when the season ends it gets boring for a few months.  Probably the biggest event of the offseason is the draft, which I think is interesting but I can't get excited about.  I don't watch college football, so I can't evaluate or project players.
+
+Most of the articles you read about the NFL draft are complete garbage.  It's speculation about player quality or draft tactics based, at best, someone who's casually watched a player in a few games.  So I decided that this year I'm going to do my own "mock draft" but it's going to be based on the best data science I can muster.
+
+If you're not interested in how I did this, [skip to the results](#results).
+
+## Scraping the data
+
+Fortuantely [Pro Football Reference](http://pro-football-reference.com/) has great data on historical [drafts](http://www.pro-football-reference.com/draft/) and [combine results](http://www.pro-football-reference.com/play-index/nfl-combine-results.cgi) from 2000-2016.  They also link to [college statistics](http://www.sports-reference.com/cfb/players/marcus-mariota-1.html) of a large number of the players who were drafted or appeared at the combine.
+
+I won't bore you with the scraping code, but you can see [how I did it](https://github.com/seanjtaylor/learning-the-draft/blob/master/scrape_pfr.R) or just directly [use the files](https://github.com/seanjtaylor/learning-the-draft/blob/master/data) I created.  This was probably the bulk of the work!
+
+I was able to gather the following data:
+
+ * `r training %>% nrow` players in total.
+ * `r draft.table %>% nrow` players that were drafted.
+ * `r combine.table %>% nrow` that appeared at the NFL combine.
+ * `r college.stats %>% with(length(unique(url)))` players with at least some basic college stats available.
+
+## Goal
+
+The goal of this exercise is to build a model that answers the following question: what is the probability that the player will be picked in the first round?  We'll assume that players with higher first round probabilities are more likely to be drafted higher. Obviously we could do something fancier, e.g. learning to rank, or regression to predict where they will be pick.  My experience was that these models performed much worse than a logistic loss function on the first round outcome.
+
+## Caveats
+
+* I'm not trying to model teams picking for certain needs (and in fact, I don't use the team information at all here.)  You could picture adding team variables or features of the team's last year draft as features here.
+* I'm not doing a proper cross-validation procedure here.  I'm using a single test-train split to pick hyper-parameters (number of rounds of boosting and tree depth).
+* There's a bit of "peeking" involved in imputing the missing combine scores.  Sorry about that, I'm lazy.
+
+## Imputing missing data
+
+Not every player performs every test at the NFL combine, so I used [mice](https://cran.r-project.org/web/packages/mice/index.html) to impute the missing combine scores.  This allows me to ignore missingness in these variables (which may be informative!) while doing machine learning.  You can see how I prepare the data [in the source files](https://github.com/seanjtaylor/learning-the-draft/blob/master/prepare_training_data.R).
+
+For the college statistics, I only use count statistics (e.g. number of tackles, number of interceptions) so you can interpret a zero as the player did not do this in college.  It's not perfect, since we are missing college data for a number of players and they will look the same as players who didn't accumulate any statistics.
+
+## Building a linear models
+
+I first tried my favorite ML tool: sparse regularized regression.  [Glmnet](https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html) is my favorite implementation.  The trick to getting good results here is producing a lot of interactions.  We are learning a different model for each position, including which colleges teams prefer as well as which statistics matter.  Because the position dummy variables are sparse, the linear model has sparse features.  The matrix has `r ncol(sparseX)` features and only `r nrow(sparseX)` rows so we'll be regularizing a lot.
+
+```{r eval=FALSE}
+library(glmnet)
+
+sparseX <- sparse.model.matrix(~  + (1 + factor(pos)) * (1 +
+                     factor(short_college) +
+                     age + height + weight +
+                     forty + bench + vertical +
+                     threecone + broad + shuttle +
+                     games + seasons +
+                     completions + attempts +
+                     pass_yards + pass_ints + pass_tds + 
+                     rec_yards + rec_td + receptions +
+                     rush_att + rush_yds + rush_td +
+                     solo_tackes + tackles + loss_tackles + ast_tackles +
+                     fum_forced + fum_rec + fum_tds + fum_yds +
+                     sacks + int + int_td + int_yards + pd +
+                     punt_returns + punt_return_td + punt_return_yards +
+                     kick_returns + kick_return_td + kick_return_yards)
+                     ,training)
+
+m1 <- cv.glmnet(sparseX[train.set,],
+                first.round[train.set],
+                alpha = 0.5,
+                family = 'binomial')
+
+training$sparse.fr.hat <- predict(m1, newx = sparseX, type = 'response')[,1]
+```
+
+The first thing we probably want to do is look at an ROC curve to see how well we do out-of-sample.  The AUC of the model is `r round(performance(prediction(training$sparse.fr.hat[test.set], first.round[test.set]), 'auc')@y.values[[1]], 2)`.
+
+```{r message=FALSE}
+library(ROCR)
+preds <- prediction(training$sparse.fr.hat[test.set], first.round[test.set])
+perf <- performance(preds, 'tpr', 'fpr')
+plot(perf)
+```
+
+## Building a dense model
+
+The results for the sparse model were kind of underwhelming, so we're going to try a more complex model.  My favorite technique these days is gradient boosting, and there's no better implementation than the [XGBoost](https://github.com/dmlc/xgboost) package.
+
+Notice that I include the in-sample predictions from the sparse model here as features.  The sparse model doesn't perform great, but it can pick up on things the tree cannot efficiently learn, such as the college and position effects.  This is essentially a cheap hack to do ensembling.
+
+```{r eval=FALSE}
+fitX <- model.matrix(~ 0 +
+                     factor(pos) +
+                     # Ensemble the sparse model here.
+                     sparse.pick.hat +
+                     age + height + weight +
+                     forty + bench + vertical +
+                     threecone + broad + shuttle +
+                     games + seasons +
+                     completions + attempts +
+                     pass_yards + pass_ints + pass_tds + 
+                     rec_yards + rec_td + receptions +
+                     rush_att + rush_yds + rush_td +
+                     solo_tackes + tackles + loss_tackles + ast_tackles +
+                     fum_forced + fum_rec + fum_tds + fum_yds +
+                     sacks + int + int_td + int_yards + pd +
+                     punt_returns + punt_return_td + punt_return_yards +
+                     kick_returns + kick_return_td + kick_return_yards
+                     ,training)
+
+b1.tuning <- expand.grid(depth = c(3, 4, 5, 6),
+                         rounds = c(50, 100, 150, 200, 250)) %>%
+  group_by(depth, rounds) %>%
+  do({
+    m <- xgboost(data = fitX[train.set,],
+                 label = first.round[train.set],
+                 max.depth = .$depth,
+                 nround =.$rounds,
+                 print.every.n = 50,
+                 objective = 'binary:logistic')
+    yhat <- predict(m, newdata = fitX)
+    data_frame(test.set = test.set, yhat = yhat, label = first.round)
+  })
+```
+
+We'll compute the AUC for each point on the grid and see which one predicts best on the test set.  Remember we'd normally do a cross-validation procedure here, but I'm lazy.
+
+```{r}
+aucs <- b1.tuning %>%
+  ungroup %>%
+  filter(test.set) %>%
+  group_by(depth, rounds) %>%
+  do({
+    auc <- performance(prediction(.$yhat, .$label), "auc")@y.values[[1]]
+    data_frame(auc = auc)
+  }) %>%
+  ungroup %>%
+  arrange(-auc)
+best <- aucs %>% head(1)
+best
+```
+
+### Testing on the 2015 Draft
+
+That's a pretty good AUC! To get another perspective, we can train on pre-2015 and look at how many of the 2015 first rounders we could predict.
+
+```{r}
+pre2015 <- with(training, year < 2015)
+b1.train <- xgboost(data = fitX[pre2015,],
+	            label = first.round[pre2015],
+                    max.depth = best$depth,
+                    nround = best$rounds,
+                    verbose = FALSE,
+                    objective = "binary:logistic")
+training$fr.hat2015 <- predict(b1.train, newdata = fitX)
+preds2015 <- training %>%
+   filter(year == 2015) %>%
+   arrange(-fr.hat2015) %>%
+   mutate(predicted.pick = row_number()) %>%
+   select(predicted.pick, pick, player, college, pos, fr.hat2015) %>%
+   head(32)
+kable(preds2015, digits = 2)
+```
+
+Not bad.  We're able to find `r preds2015 %>% with(100*round(sum(pick <= 32) / 32, 2))`% of the first round picks just using machine learning and combine/college data.  I did not watch a single college football game in 2014 and I could have done almost as good as the experts ;)
+
+We can also look to see how these predictions correlate across the whole draft:
+
+```{r message=FALSE}
+library(ggplot2)
+training %>%
+   filter(year == 2015) %>%
+   ggplot(aes(x = pick, y = fr.hat2015)) +
+   geom_smooth() +
+   geom_point(size = 0.5) +
+   theme_bw() +
+   xlab('Pick') + ylab('P(first round)')
+```
+
+## 2016 Results
+
+<a name="results"/>
+
+Let's predict the first round of the 2016 NFL draft! We'll train one final model on all the pre-2016 data with the hyperparameters we chose.
+
+```{r}
+training %>%
+   filter(year == 2016) %>%
+   arrange(-fr.hat) %>%
+   mutate(predicted.pick = row_number()) %>%
+   select(predicted.pick, player, college, pos, fr.hat) %>%
+   head(32) %>%
+   kable(digits = 2)
+```
+
+A few simple observations:
+
+- Jared Goff is (probably correctly) rated the number 1 overall pick.
+- Carson Wentz is ranked very lowly (actually his probability of being in the first round is `r training %>% filter(player == 'Carson Wentz') %>% with(sparse.fr.hat) %>% round(2)`%).  This is actually consistent with the model, since he's from a small school and his college statistics aren't available.
+- Derrick Henry is now the first running back off the board over Ezekiel Elliott.  The things Elliot is praised for (blocking, being a good all-around back) are not highly measurable and would be discounted here.
+- Trevor Davis is an interesting one.  He's got very rare combine measurables, but is projected to be a much lower pick by most experts.
